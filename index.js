@@ -1,6 +1,7 @@
 'use strict';
 
 const Slack = require('slack-client');
+var redis = require('redis');
 
 const Teams = require('./teams.json');
 var maxPlayers;
@@ -14,6 +15,8 @@ function kartbot(opts) {
   maxPlayers = opts.maxPlayers || 4;
 
   var slack = new Slack(slackToken, autoReconnect, autoMark);
+
+  var redisClient = redis.createClient();
 
   // pool of players currently playing
   var pool = [];
@@ -34,7 +37,11 @@ function kartbot(opts) {
 
     var members;
     if (channel.members) {
-      members = channel.members.map(function(member) {
+      members = channel.members.filter(function(member) {
+        let m = slack.getUserByID(member);
+        return (m.presence === 'active' && !m.is_bot);
+      })
+      .map(function(member) {
         return slack.getUserByID(member).name;
       });
     }
@@ -59,7 +66,7 @@ function kartbot(opts) {
 
           var res = responses[Math.floor(Math.random() * responses.length)];
 
-          channel.send(`Hi ${upper(user.name)} ${res}`);
+          channel.send(`Hi ${upper(user.name)}${res}`);
 
           break;
 
@@ -84,21 +91,21 @@ function kartbot(opts) {
 
         // show amount of times members have challenged and have been challenged
         case (args[0] === '!stats'):
+          getStats(redisClient, user, channel, args)
+          break;
 
+        // join the game in progress
+        case (args[0] === '!join'):
+          pool = join(channel, user, pool);
           break;
 
         case (args[0] === '!list'):
-          if (pool && pool.length > 0) {
-            var names = pool.map(upper);
-            channel.send(`${names.join(', ')} are currently challenged!`);
-          } else {
-            channel.send('No challengers have challenged challengees! This makes kartbot sad :(');
-          }
+          list(channel, pool);
           break;
 
         // roll the dice against someone else
         case (args[0] === '!roll'):
-          roll(args, user, channel, members);
+          roll(args, user, channel, members, redisClient);
           break;
 
         // send list of commands
@@ -107,8 +114,8 @@ function kartbot(opts) {
           channel.send(`> \`!kart\` - Challenge random channel members to Mario Kart`);
           channel.send(`> \`!fifa\` - Challenge random channel members to Fifa with random teams`);
           channel.send(`> \`!smash\` - Challenge random channel members to Smash Bros`);
-          channel.send(`> \`!nokart\` - Reject the challenge :(`);
-          channel.send(`> \`!nofifa\` - Reject the challenge :(`);
+          channel.send(`> \`!nokart\` - Reject the kart challenge :(`);
+          channel.send(`> \`!nofifa\` - Reject the fifa challenge :(`);
           channel.send(`> \`!list\` - See who's currently challenged`);
           channel.send(`> \`!roll USER\` - Challenge someone in the channel to a game of chance`);
           break;
@@ -123,7 +130,54 @@ function kartbot(opts) {
   slack.login();
 };
 
-function roll(args, user, channel, members) {
+function getStats(redisClient, user, channel, args) {
+  redisClient.get(`${user.name}_challenges`, function(err, result) {
+    channel.send(`${upper(user.name)}'s challenges: ${result}`);
+  });
+
+  redisClient.get(`${user.name}_wins`, function(err, result) {
+    channel.send(`${user.name}'s wins: ${result}`);
+  });
+}
+
+function list(channel, pool) {
+  if (pool && pool.length > 0) {
+    var names = pool.map(upper);
+    channel.send(`${names.join(', ')} are currently challenged!`);
+  } else {
+    channel.send('No challengers have challenged challengees! This makes kartbot sad :(');
+  }
+}
+
+function join(channel, user, pool) {
+  if (pool.length >= maxPlayers) {
+    channel.send(`Sorry ${upper(user.name)}, but the game is full! Ask one of these guys if they will give up their place:
+      ${pool.map(function(u) {
+        return upper(u.name);
+      }).join(', ')}`);
+    return pool;
+  }
+
+  if (pool.indexOf(user.name) > -1) {
+    channel.send(`You are already in the game, ${upper(user.name)}!`);
+    return pool;
+  }
+
+  pool.push(user.name);
+
+  var ret = '';
+
+  if (pool.length < (maxPlayers - 1)) {
+    ret = ` Room for ${(maxPlayers - 1) - pool.length} more!`;
+  }
+
+  channel.send(`${upper(user.name)} has joined!`);
+  list(channel, pool);
+
+  return pool;
+}
+
+function roll(args, user, channel, members, redisClient) {
   // if someone tries to PM kartbot
   if (!members) {
     channel.send('No thanks, that seems a bit pointless.');
@@ -141,9 +195,31 @@ function roll(args, user, channel, members) {
         c = upper(user.name),
         o = upper(args[1]);
 
+    // reroll in the unlikely event that it's a tie
+    while (firstRoll === secondRoll) {
+      secondRoll = Math.round(Math.random() * 100);
+    }
+
     var winner = firstRoll > secondRoll ? c : o;
 
     channel.send(`${c} fancies their chances against ${o}!\n${c} rolls: ${firstRoll}\n${o} rolls: ${secondRoll}\n\n*${winner} is the winner!*`);
+
+    var key = `${user.name}_challenges`;
+
+    // set amount of times challenged
+    redisClient.get(key, function(err, result) {
+      var challenges = parseInt(result || 1, 10) + 1;
+      console.log('challenges:', challenges);
+      redisClient.set(key, challenges.toString());
+    });
+
+    // set amount of times won
+    key = `${winner}_wins`;
+    redisClient.get(key, function(err, result) {
+      var wins = parseInt(result || 1, 10) + 1;
+      redisClient.set(key, wins.toString());
+    });
+
   } else {
     // stop people from trying !roll without a command
     var joined = args.slice(1).join(' ');
@@ -153,7 +229,7 @@ function roll(args, user, channel, members) {
 }
 
 function reject(channel, members, user, pool) {
-  if (pool.indexOf(user.name) > 0) {
+  if (pool.indexOf(user.name) > -1) {
     // if the challenger drops out, cancel the whole thing
     if (pool[pool.length - 1] === user.name) {
       channel.send(upper(`${user.name} dropped out, challenge has been cancelled!`));
